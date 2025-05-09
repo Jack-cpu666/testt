@@ -1,3 +1,4 @@
-Flask
-paypalserversdk
-gunicorn
+Flask==2.2.5
+gunicorn==20.1.0
+numpy
+paypal-server-sdk==1.0.0
