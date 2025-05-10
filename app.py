@@ -1,4 +1,3 @@
-
 import os
 import shutil
 import zipfile
@@ -85,6 +84,17 @@ HTML_TEMPLATE = '''
         #statusMessage {
             font-weight: bold;
         }
+        .nav-tabs {
+            margin-bottom: 20px;
+        }
+        #codeEditor {
+            width: 100%;
+            min-height: 200px;
+            font-family: monospace;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            padding: 10px;
+        }
     </style>
 </head>
 <body>
@@ -103,68 +113,151 @@ HTML_TEMPLATE = '''
         {% endwith %}
 
         <div class="form-container">
-            <form method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data" id="uploadForm">
-                <div class="mb-3">
-                    <label for="pyfile" class="form-label">Select Python file:</label>
-                    <input type="file" class="form-control" id="pyfile" name="file" accept=".py" required>
-                </div>
-                
-                <div class="options-container">
-                    <h5>Build Options</h5>
-                    <div class="row">
-                        <div class="col-md-6">
-                            <div class="form-check mb-2">
-                                <input class="form-check-input" type="checkbox" id="oneFile" name="one_file" checked>
-                                <label class="form-check-label" for="oneFile">
-                                    One-file bundle
-                                </label>
+            <ul class="nav nav-tabs" id="inputTabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="upload-tab" data-bs-toggle="tab" data-bs-target="#upload-tab-pane" type="button" role="tab" aria-controls="upload-tab-pane" aria-selected="true">Upload File</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="paste-tab" data-bs-toggle="tab" data-bs-target="#paste-tab-pane" type="button" role="tab" aria-controls="paste-tab-pane" aria-selected="false">Paste Code</button>
+                </li>
+            </ul>
+            
+            <div class="tab-content" id="inputTabsContent">
+                <div class="tab-pane fade show active" id="upload-tab-pane" role="tabpanel" aria-labelledby="upload-tab" tabindex="0">
+                    <form method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data" id="uploadForm">
+                        <input type="hidden" name="input_type" value="file">
+                        <div class="mb-3">
+                            <label for="pyfile" class="form-label">Select Python file:</label>
+                            <input type="file" class="form-control" id="pyfile" name="file" accept=".py" required>
+                        </div>
+                        
+                        <!-- Build options section -->
+                        <div class="options-container" id="fileOptions">
+                            <h5>Build Options</h5>
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <div class="form-check mb-2">
+                                        <input class="form-check-input" type="checkbox" id="oneFile" name="one_file" checked>
+                                        <label class="form-check-label" for="oneFile">
+                                            One-file bundle
+                                        </label>
+                                    </div>
+                                    <div class="form-check mb-2">
+                                        <input class="form-check-input" type="checkbox" id="console" name="console" checked>
+                                        <label class="form-check-label" for="console">
+                                            Console application
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="form-check mb-2">
+                                        <input class="form-check-input" type="checkbox" id="uac" name="uac">
+                                        <label class="form-check-label" for="uac">
+                                            Request admin privileges
+                                        </label>
+                                    </div>
+                                    <div class="form-check mb-2">
+                                        <input class="form-check-input" type="checkbox" id="debug" name="debug">
+                                        <label class="form-check-label" for="debug">
+                                            Debug mode
+                                        </label>
+                                    </div>
+                                </div>
                             </div>
-                            <div class="form-check mb-2">
-                                <input class="form-check-input" type="checkbox" id="console" name="console" checked>
-                                <label class="form-check-label" for="console">
-                                    Console application
-                                </label>
+                            
+                            <div class="mb-3 mt-3">
+                                <label for="extraPackages" class="form-label">Additional packages (comma separated):</label>
+                                <input type="text" class="form-control" id="extraPackages" name="packages" placeholder="numpy,pandas,matplotlib">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="extraFiles" class="form-label">Additional files (uploaded later):</label>
+                                <input type="file" class="form-control" id="extraFiles" name="extra_files" multiple>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="targetPlatform" class="form-label">Target Platform:</label>
+                                <select class="form-select" id="targetPlatform" name="platform">
+                                    <option value="auto" selected>Auto-detect</option>
+                                    <option value="windows">Windows</option>
+                                    <option value="linux">Linux</option>
+                                    <option value="macos">macOS</option>
+                                </select>
                             </div>
                         </div>
-                        <div class="col-md-6">
-                            <div class="form-check mb-2">
-                                <input class="form-check-input" type="checkbox" id="uac" name="uac">
-                                <label class="form-check-label" for="uac">
-                                    Request admin privileges
-                                </label>
-                            </div>
-                            <div class="form-check mb-2">
-                                <input class="form-check-input" type="checkbox" id="debug" name="debug">
-                                <label class="form-check-label" for="debug">
-                                    Debug mode
-                                </label>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="mb-3 mt-3">
-                        <label for="extraPackages" class="form-label">Additional packages (comma separated):</label>
-                        <input type="text" class="form-control" id="extraPackages" name="packages" placeholder="numpy,pandas,matplotlib">
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label for="extraFiles" class="form-label">Additional files (uploaded later):</label>
-                        <input type="file" class="form-control" id="extraFiles" name="extra_files" multiple>
-                    </div>
-                    
-                    <div class="mb-3">
-                        <label for="targetPlatform" class="form-label">Target Platform:</label>
-                        <select class="form-select" id="targetPlatform" name="platform">
-                            <option value="auto" selected>Auto-detect</option>
-                            <option value="windows">Windows</option>
-                            <option value="linux">Linux</option>
-                            <option value="macos">macOS</option>
-                        </select>
-                    </div>
+                        
+                        <button type="submit" class="btn btn-primary w-100" id="uploadSubmitBtn">Convert to EXE</button>
+                    </form>
                 </div>
                 
-                <button type="submit" class="btn btn-primary w-100" id="submitBtn">Convert to EXE</button>
-            </form>
+                <div class="tab-pane fade" id="paste-tab-pane" role="tabpanel" aria-labelledby="paste-tab" tabindex="0">
+                    <form method="POST" action="{{ url_for('paste_code') }}" id="pasteForm">
+                        <input type="hidden" name="input_type" value="paste">
+                        <div class="mb-3">
+                            <label for="codeEditor" class="form-label">Python Code:</label>
+                            <textarea class="form-control" id="codeEditor" name="code" rows="10" required placeholder="Paste your Python code here..."></textarea>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label for="filename" class="form-label">Filename (with .py extension):</label>
+                            <input type="text" class="form-control" id="filename" name="filename" placeholder="main.py" required pattern=".*\.py$">
+                            <div class="form-text">Filename must end with .py</div>
+                        </div>
+                        
+                        <!-- Build options section (duplicated for the paste form) -->
+                        <div class="options-container" id="pasteOptions">
+                            <h5>Build Options</h5>
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <div class="form-check mb-2">
+                                        <input class="form-check-input" type="checkbox" id="oneFilePaste" name="one_file" checked>
+                                        <label class="form-check-label" for="oneFilePaste">
+                                            One-file bundle
+                                        </label>
+                                    </div>
+                                    <div class="form-check mb-2">
+                                        <input class="form-check-input" type="checkbox" id="consolePaste" name="console" checked>
+                                        <label class="form-check-label" for="consolePaste">
+                                            Console application
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="col-md-6">
+                                    <div class="form-check mb-2">
+                                        <input class="form-check-input" type="checkbox" id="uacPaste" name="uac">
+                                        <label class="form-check-label" for="uacPaste">
+                                            Request admin privileges
+                                        </label>
+                                    </div>
+                                    <div class="form-check mb-2">
+                                        <input class="form-check-input" type="checkbox" id="debugPaste" name="debug">
+                                        <label class="form-check-label" for="debugPaste">
+                                            Debug mode
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="mb-3 mt-3">
+                                <label for="extraPackagesPaste" class="form-label">Additional packages (comma separated):</label>
+                                <input type="text" class="form-control" id="extraPackagesPaste" name="packages" placeholder="numpy,pandas,matplotlib">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="targetPlatformPaste" class="form-label">Target Platform:</label>
+                                <select class="form-select" id="targetPlatformPaste" name="platform">
+                                    <option value="auto" selected>Auto-detect</option>
+                                    <option value="windows">Windows</option>
+                                    <option value="linux">Linux</option>
+                                    <option value="macos">macOS</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <button type="submit" class="btn btn-primary w-100" id="pasteSubmitBtn">Convert to EXE</button>
+                    </form>
+                </div>
+            </div>
             
             <div id="conversionStatus" style="display: none;">
                 <div class="alert alert-info mt-3">
@@ -200,17 +293,29 @@ HTML_TEMPLATE = '''
     
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+        // Handle form submission for file upload
         document.getElementById('uploadForm').addEventListener('submit', function(e) {
             e.preventDefault();
-            
+            startConversion(this, 'uploadSubmitBtn');
+        });
+        
+        // Handle form submission for code paste
+        document.getElementById('pasteForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            startConversion(this, 'pasteSubmitBtn');
+        });
+        
+        function startConversion(form, buttonId) {
             // Show progress UI
             document.getElementById('conversionStatus').style.display = 'block';
-            document.getElementById('submitBtn').disabled = true;
-            document.getElementById('submitBtn').innerHTML = 'Converting... Please wait';
+            document.getElementById(buttonId).disabled = true;
+            document.getElementById(buttonId).innerHTML = 'Converting... Please wait';
             
-            // Submit the form data via AJAX to start the conversion
-            const formData = new FormData(this);
-            fetch('{{ url_for('upload_file') }}', {
+            // Submit the form data via AJAX
+            const formData = new FormData(form);
+            const action = form.getAttribute('action');
+            
+            fetch(action, {
                 method: 'POST',
                 body: formData
             })
@@ -226,8 +331,8 @@ HTML_TEMPLATE = '''
                     document.getElementById('progressBar').style.width = '100%';
                     document.getElementById('progressBar').classList.remove('bg-info', 'bg-success');
                     document.getElementById('progressBar').classList.add('bg-danger');
-                    document.getElementById('submitBtn').disabled = false;
-                    document.getElementById('submitBtn').innerHTML = 'Try Again';
+                    document.getElementById(buttonId).disabled = false;
+                    document.getElementById(buttonId).innerHTML = 'Try Again';
                 }
             })
             .catch(error => {
@@ -236,10 +341,10 @@ HTML_TEMPLATE = '''
                 document.getElementById('progressBar').style.width = '100%';
                 document.getElementById('progressBar').classList.remove('bg-info', 'bg-success');
                 document.getElementById('progressBar').classList.add('bg-danger');
-                document.getElementById('submitBtn').disabled = false;
-                document.getElementById('submitBtn').innerHTML = 'Try Again';
+                document.getElementById(buttonId).disabled = false;
+                document.getElementById(buttonId).innerHTML = 'Try Again';
             });
-        });
+        }
         
         function pollStatus(sessionId) {
             fetch(`/status/${sessionId}`)
@@ -275,8 +380,10 @@ HTML_TEMPLATE = '''
                             document.getElementById('progressBar').classList.remove('bg-info');
                             document.getElementById('progressBar').classList.add('bg-danger');
                             document.getElementById('statusMessage').innerText = 'Error: ' + data.message;
-                            document.getElementById('submitBtn').disabled = false;
-                            document.getElementById('submitBtn').innerHTML = 'Try Again';
+                            document.getElementById('uploadSubmitBtn').disabled = false;
+                            document.getElementById('uploadSubmitBtn').innerHTML = 'Try Again';
+                            document.getElementById('pasteSubmitBtn').disabled = false;
+                            document.getElementById('pasteSubmitBtn').innerHTML = 'Try Again';
                         }
                     } else {
                         // Continue polling
@@ -325,7 +432,8 @@ def upload_file():
             'success': False,
             'message': '',
             'log': [],
-            'download_url': None
+            'download_url': None,
+            'timestamp': time.time()
         }
         
         # Create work directory
@@ -373,6 +481,74 @@ def upload_file():
         
     except Exception as e:
         logger.error(f"Error initiating conversion: {str(e)}")
+        return jsonify(success=False, message=f'Error: {str(e)}')
+
+@app.route('/paste', methods=['POST'])
+def paste_code():
+    if 'code' not in request.form or not request.form['code'].strip():
+        return jsonify(success=False, message='No code provided')
+    
+    if 'filename' not in request.form or not request.form['filename'].strip():
+        return jsonify(success=False, message='No filename provided')
+    
+    filename = request.form['filename'].strip()
+    if not filename.endswith('.py'):
+        return jsonify(success=False, message='Filename must end with .py')
+    
+    try:
+        # Create session ID
+        session_id = str(uuid.uuid4())
+        session['session_id'] = session_id
+        
+        # Initialize status
+        conversion_status[session_id] = {
+            'progress': 0,
+            'status': 'Initializing...',
+            'completed': False,
+            'success': False,
+            'message': '',
+            'log': [],
+            'download_url': None,
+            'timestamp': time.time()
+        }
+        
+        # Create work directory
+        work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
+        os.makedirs(work_dir, exist_ok=True)
+        
+        # Save the pasted code to a file
+        code = request.form['code']
+        filename = secure_filename(filename)
+        file_path = os.path.join(work_dir, filename)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(code)
+        
+        # Get options
+        options = {
+            'one_file': 'one_file' in request.form,
+            'console': 'console' in request.form,
+            'uac': 'uac' in request.form,
+            'debug': 'debug' in request.form,
+            'packages': request.form.get('packages', ''),
+            'platform': request.form.get('platform', 'auto'),
+            'file_path': file_path,
+            'work_dir': work_dir,
+            'extra_files': []
+        }
+        
+        # Start conversion in background thread
+        thread = threading.Thread(
+            target=convert_in_background,
+            args=(session_id, options),
+            daemon=True
+        )
+        thread.start()
+        
+        return jsonify(success=True, message='Conversion started', session_id=session_id)
+        
+    except Exception as e:
+        logger.error(f"Error initiating conversion from pasted code: {str(e)}")
         return jsonify(success=False, message=f'Error: {str(e)}')
 
 def update_status(session_id, progress=None, status=None, completed=None, success=None, message=None, log=None, download_url=None):
