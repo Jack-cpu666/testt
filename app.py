@@ -9,22 +9,28 @@ import threading
 import time
 import json
 from flask import Flask, request, render_template_string, send_file, redirect, url_for, flash, session, jsonify
+from flask.sessions import SecureCookieSessionInterface
 from werkzeug.utils import secure_filename
 import logging
 from datetime import datetime
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Initialize Flask app with better session handling
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
 app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp()
 app.config['ALLOWED_EXTENSIONS'] = {'py'}
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config['PERMANENT_SESSION_LIFETIME'] = 3600  # Session lasts 1 hour
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SESSION_COOKIE_SECURE', 'False').lower() == 'true'
 
 # Detect if running on Render
 ON_RENDER = 'RENDER' in os.environ
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Store conversion status
 conversion_status = {}
@@ -293,6 +299,9 @@ HTML_TEMPLATE = '''
     
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+        // Session ID storage
+        let currentSessionId = '';
+        
         // Handle form submission for file upload
         document.getElementById('uploadForm').addEventListener('submit', function(e) {
             e.preventDefault();
@@ -311,20 +320,31 @@ HTML_TEMPLATE = '''
             document.getElementById(buttonId).disabled = true;
             document.getElementById(buttonId).innerHTML = 'Converting... Please wait';
             
+            // Clear previous log content
+            document.getElementById('logContent').innerHTML = '';
+            document.getElementById('progressBar').style.width = '0%';
+            document.getElementById('progressBar').classList.remove('bg-danger', 'bg-success');
+            document.getElementById('progressBar').classList.add('bg-info');
+            
             // Submit the form data via AJAX
             const formData = new FormData(form);
             const action = form.getAttribute('action');
             
             fetch(action, {
                 method: 'POST',
-                body: formData
+                body: formData,
+                credentials: 'same-origin'  // Important for session cookies
             })
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
-                    // Start polling for status updates
-                    const sessionId = data.session_id;
-                    pollStatus(sessionId);
+                    // Store session ID and start polling
+                    currentSessionId = data.session_id;
+                    pollStatus(data.session_id);
+                    
+                    // Log initial status
+                    const logElement = document.getElementById('logContent');
+                    logElement.innerHTML += `<div>[${new Date().toLocaleTimeString()}] Conversion started with session ID: ${data.session_id}</div>`;
                 } else {
                     // Show error
                     document.getElementById('statusMessage').innerText = 'Error: ' + data.message;
@@ -333,6 +353,10 @@ HTML_TEMPLATE = '''
                     document.getElementById('progressBar').classList.add('bg-danger');
                     document.getElementById(buttonId).disabled = false;
                     document.getElementById(buttonId).innerHTML = 'Try Again';
+                    
+                    // Log error
+                    const logElement = document.getElementById('logContent');
+                    logElement.innerHTML += `<div class="text-danger">[${new Date().toLocaleTimeString()}] Error: ${data.message}</div>`;
                 }
             })
             .catch(error => {
@@ -343,58 +367,97 @@ HTML_TEMPLATE = '''
                 document.getElementById('progressBar').classList.add('bg-danger');
                 document.getElementById(buttonId).disabled = false;
                 document.getElementById(buttonId).innerHTML = 'Try Again';
+                
+                // Log error
+                const logElement = document.getElementById('logContent');
+                logElement.innerHTML += `<div class="text-danger">[${new Date().toLocaleTimeString()}] Server error: ${error.message}</div>`;
             });
         }
         
         function pollStatus(sessionId) {
-            fetch(`/status/${sessionId}`)
-                .then(response => response.json())
-                .then(data => {
-                    // Update progress bar
-                    document.getElementById('progressBar').style.width = data.progress + '%';
+            fetch(`/status/${sessionId}`, {
+                credentials: 'same-origin'  // Important for session cookies
+            })
+            .then(response => response.json())
+            .then(data => {
+                // Check if session is valid
+                if (data.message === 'Invalid session ID') {
+                    // Try to recover
+                    document.getElementById('statusMessage').innerText = 'Session error. Please try again.';
+                    document.getElementById('progressBar').style.width = '100%';
+                    document.getElementById('progressBar').classList.remove('bg-info', 'bg-success');
+                    document.getElementById('progressBar').classList.add('bg-danger');
+                    document.getElementById('uploadSubmitBtn').disabled = false;
+                    document.getElementById('uploadSubmitBtn').innerHTML = 'Try Again';
+                    document.getElementById('pasteSubmitBtn').disabled = false;
+                    document.getElementById('pasteSubmitBtn').innerHTML = 'Try Again';
                     
-                    // Update status message
-                    document.getElementById('statusMessage').innerText = data.status;
-                    
-                    // Update log content
-                    if (data.log) {
-                        const logElement = document.getElementById('logContent');
-                        logElement.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${data.log}</div>`;
-                        logElement.scrollTop = logElement.scrollHeight;
-                    }
-                    
-                    if (data.completed) {
-                        if (data.success) {
-                            // Show success and download link
-                            document.getElementById('progressBar').classList.add('bg-success');
-                            document.getElementById('conversionStatus').innerHTML = `
-                                <div class="alert alert-success mt-3">
-                                    <h5>Conversion successful!</h5>
-                                    <p>Your executable has been created successfully.</p>
-                                    <a href="${data.download_url}" class="btn btn-success">Download EXE</a>
-                                </div>
-                            `;
-                        } else {
-                            // Show error
-                            document.getElementById('progressBar').style.width = '100%';
-                            document.getElementById('progressBar').classList.remove('bg-info');
-                            document.getElementById('progressBar').classList.add('bg-danger');
-                            document.getElementById('statusMessage').innerText = 'Error: ' + data.message;
-                            document.getElementById('uploadSubmitBtn').disabled = false;
-                            document.getElementById('uploadSubmitBtn').innerHTML = 'Try Again';
-                            document.getElementById('pasteSubmitBtn').disabled = false;
-                            document.getElementById('pasteSubmitBtn').innerHTML = 'Try Again';
-                        }
+                    const logElement = document.getElementById('logContent');
+                    logElement.innerHTML += `<div class="text-danger">[${new Date().toLocaleTimeString()}] Session error: Invalid session ID</div>`;
+                    return;
+                }
+                
+                // Update progress bar
+                document.getElementById('progressBar').style.width = data.progress + '%';
+                
+                // Update status message
+                document.getElementById('statusMessage').innerText = data.status;
+                
+                // Update log content
+                if (data.log) {
+                    const logElement = document.getElementById('logContent');
+                    logElement.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${data.log}</div>`;
+                    logElement.scrollTop = logElement.scrollHeight;
+                }
+                
+                if (data.completed) {
+                    if (data.success) {
+                        // Show success and download link
+                        document.getElementById('progressBar').classList.add('bg-success');
+                        document.getElementById('conversionStatus').innerHTML = `
+                            <div class="alert alert-success mt-3">
+                                <h5>Conversion successful!</h5>
+                                <p>Your executable has been created successfully.</p>
+                                <a href="${data.download_url}" class="btn btn-success">Download EXE</a>
+                            </div>
+                        `;
                     } else {
-                        // Continue polling
-                        setTimeout(() => pollStatus(sessionId), 1000);
+                        // Show error
+                        document.getElementById('progressBar').style.width = '100%';
+                        document.getElementById('progressBar').classList.remove('bg-info');
+                        document.getElementById('progressBar').classList.add('bg-danger');
+                        document.getElementById('statusMessage').innerText = 'Error: ' + data.message;
+                        document.getElementById('uploadSubmitBtn').disabled = false;
+                        document.getElementById('uploadSubmitBtn').innerHTML = 'Try Again';
+                        document.getElementById('pasteSubmitBtn').disabled = false;
+                        document.getElementById('pasteSubmitBtn').innerHTML = 'Try Again';
                     }
-                })
-                .catch(error => {
-                    console.error('Error polling status:', error);
-                    setTimeout(() => pollStatus(sessionId), 2000); // Retry with longer delay
-                });
+                } else {
+                    // Continue polling
+                    setTimeout(() => pollStatus(sessionId), 1000);
+                }
+            })
+            .catch(error => {
+                console.error('Error polling status:', error);
+                
+                const logElement = document.getElementById('logContent');
+                logElement.innerHTML += `<div class="text-warning">[${new Date().toLocaleTimeString()}] Network error while checking status: ${error.message}. Retrying...</div>`;
+                
+                // Retry with longer delay
+                setTimeout(() => pollStatus(sessionId), 2000);
+            });
         }
+        
+        // Add window beforeunload event to warn about leaving during conversion
+        window.addEventListener('beforeunload', function(e) {
+            if (document.getElementById('conversionStatus').style.display !== 'none' && 
+                !document.getElementById('progressBar').classList.contains('bg-success') &&
+                !document.getElementById('progressBar').classList.contains('bg-danger')) {
+                e.preventDefault();
+                e.returnValue = 'Conversion is in progress. Are you sure you want to leave?';
+                return e.returnValue;
+            }
+        });
     </script>
 </body>
 </html>
@@ -423,6 +486,9 @@ def upload_file():
         # Create session ID
         session_id = str(uuid.uuid4())
         session['session_id'] = session_id
+        session.modified = True  # Explicitly mark the session as modified
+        
+        logger.info(f"Created new session: {session_id}")
         
         # Initialize status
         conversion_status[session_id] = {
@@ -499,6 +565,9 @@ def paste_code():
         # Create session ID
         session_id = str(uuid.uuid4())
         session['session_id'] = session_id
+        session.modified = True  # Explicitly mark the session as modified
+        
+        logger.info(f"Created new session from pasted code: {session_id}")
         
         # Initialize status
         conversion_status[session_id] = {
@@ -566,13 +635,19 @@ def update_status(session_id, progress=None, status=None, completed=None, succes
             conversion_status[session_id]['message'] = message
         if log is not None:
             conversion_status[session_id]['log'].append(log)
+            logger.info(f"Session {session_id}: {log}")
         if download_url is not None:
             conversion_status[session_id]['download_url'] = download_url
 
 @app.route('/status/<session_id>')
 def get_status(session_id):
     """Get the current conversion status"""
+    logger.info(f"Status requested for session: {session_id}")
+    logger.info(f"Current sessions: {list(conversion_status.keys())}")
+    logger.info(f"Flask session ID: {session.get('session_id')}")
+    
     if session_id not in conversion_status:
+        logger.warning(f"Session ID not found: {session_id}")
         return jsonify(
             progress=0,
             status='Session not found',
@@ -789,10 +864,10 @@ def convert_in_background(session_id, options):
 
 @app.route('/download/<session_id>/<filename>')
 def download_file(session_id, filename):
-    if 'session_id' not in session or session['session_id'] != session_id:
-        flash('Invalid download session', 'danger')
-        return redirect(url_for('index'))
+    logger.info(f"Download requested: {session_id}/{filename}")
+    logger.info(f"Current session ID: {session.get('session_id')}")
     
+    # More permissive approach for downloads to prevent session issues
     work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
     
     if filename.endswith('.zip'):
@@ -803,23 +878,37 @@ def download_file(session_id, filename):
     if not os.path.exists(file_path):
         flash('File not found', 'danger')
         return redirect(url_for('index'))
-        
+    
+    logger.info(f"Sending file: {file_path}")
     return send_file(file_path, as_attachment=True)
 
 @app.route('/cleanup/<session_id>')
 def cleanup(session_id):
-    if 'session_id' in session and session['session_id'] == session_id:
+    if session_id in conversion_status:
         work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
         if os.path.exists(work_dir):
-            shutil.rmtree(work_dir)
+            try:
+                shutil.rmtree(work_dir)
+                logger.info(f"Cleaned up session directory: {session_id}")
+            except Exception as e:
+                logger.error(f"Error cleaning up directory for session {session_id}: {str(e)}")
         
         # Clean up status dictionary
-        if session_id in conversion_status:
+        try:
             del conversion_status[session_id]
-            
-        session.pop('session_id', None)
+            logger.info(f"Removed session from status tracker: {session_id}")
+        except KeyError:
+            logger.warning(f"Session {session_id} not found in status tracker")
+    
+    # Clear session cookie
+    session.clear()
     
     return redirect(url_for('index'))
+
+# Add a health check endpoint
+@app.route('/health')
+def health_check():
+    return jsonify(status="healthy", uptime=time.time())
 
 # Periodic cleanup task
 def cleanup_old_sessions():
@@ -832,6 +921,7 @@ def cleanup_old_sessions():
             for session_id in session_ids:
                 if conversion_status[session_id]['completed'] and current_time - conversion_status[session_id].get('timestamp', 0) > 3600:
                     del conversion_status[session_id]
+                    logger.info(f"Cleaned up old session from status tracker: {session_id}")
             
             # Clean up old directories
             for item in os.listdir(app.config['UPLOAD_FOLDER']):
@@ -839,8 +929,11 @@ def cleanup_old_sessions():
                 if os.path.isdir(item_path):
                     # Check if directory is older than 1 hour
                     if current_time - os.path.getmtime(item_path) > 3600:
-                        logger.info(f"Cleaning up old session: {item}")
-                        shutil.rmtree(item_path)
+                        try:
+                            logger.info(f"Cleaning up old session directory: {item}")
+                            shutil.rmtree(item_path)
+                        except Exception as e:
+                            logger.error(f"Error cleaning up directory {item}: {str(e)}")
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
             
@@ -855,8 +948,10 @@ cleanup_thread.start()
 def ensure_pyinstaller():
     try:
         import PyInstaller
+        logger.info("PyInstaller is already installed")
     except ImportError:
         try:
+            logger.info("Installing PyInstaller...")
             subprocess.run(
                 [sys.executable, '-m', 'pip', 'install', 'pyinstaller'],
                 check=True
@@ -868,7 +963,14 @@ def ensure_pyinstaller():
             # Continue anyway, we'll handle it during conversion
 
 if __name__ == '__main__':
+    # Ensure temp directory exists
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    logger.info(f"Using temp directory: {app.config['UPLOAD_FOLDER']}")
+    
+    # Install required packages
     ensure_pyinstaller()
+    
     # For render.com deployment
     port = int(os.environ.get('PORT', 5000))
+    logger.info(f"Starting server on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
