@@ -9,30 +9,87 @@ import threading
 import time
 import json
 from flask import Flask, request, render_template_string, send_file, redirect, url_for, flash, session, jsonify
-from flask.sessions import SecureCookieSessionInterface
 from werkzeug.utils import secure_filename
 import logging
 from datetime import datetime
+import redis
+from flask_session import Session
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app with better session handling
+# Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
 app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp()
 app.config['ALLOWED_EXTENSIONS'] = {'py'}
-app.config['SESSION_TYPE'] = 'filesystem'
 app.config['PERMANENT_SESSION_LIFETIME'] = 3600  # Session lasts 1 hour
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SESSION_COOKIE_SECURE', 'False').lower() == 'true'
+
+# Set up Redis for session and conversion status storage
+redis_url = os.environ.get('REDIS_URL')
+if redis_url:
+    logger.info(f"Using Redis for session storage: {redis_url}")
+    app.config['SESSION_TYPE'] = 'redis'
+    app.config['SESSION_REDIS'] = redis.from_url(redis_url)
+else:
+    logger.info("Redis URL not found, using filesystem for session storage")
+    app.config['SESSION_TYPE'] = 'filesystem'
+    app.config['SESSION_FILE_DIR'] = tempfile.mkdtemp()
+
+# Initialize the session interface
+Session(app)
 
 # Detect if running on Render
 ON_RENDER = 'RENDER' in os.environ
 
-# Store conversion status
+# Redis helpers for conversion status
+def get_conversion_status(session_id):
+    """Get conversion status from Redis or memory"""
+    if redis_url:
+        r = redis.from_url(redis_url)
+        status_data = r.get(f'conversion_status:{session_id}')
+        return json.loads(status_data) if status_data else None
+    else:
+        return conversion_status.get(session_id)
+
+def set_conversion_status(session_id, data):
+    """Store conversion status in Redis or memory"""
+    if redis_url:
+        r = redis.from_url(redis_url)
+        r.set(f'conversion_status:{session_id}', json.dumps(data))
+        # Set expiration to 1 hour
+        r.expire(f'conversion_status:{session_id}', 3600)
+    else:
+        conversion_status[session_id] = data
+
+def update_conversion_status(session_id, progress=None, status=None, completed=None, 
+                             success=None, message=None, log=None, download_url=None):
+    """Update conversion status fields"""
+    data = get_conversion_status(session_id)
+    if data:
+        if progress is not None:
+            data['progress'] = progress
+        if status is not None:
+            data['status'] = status
+        if completed is not None:
+            data['completed'] = completed
+        if success is not None:
+            data['success'] = success
+        if message is not None:
+            data['message'] = message
+        if log is not None:
+            data['log'].append(log)
+            logger.info(f"Session {session_id}: {log}")
+        if download_url is not None:
+            data['download_url'] = download_url
+        
+        set_conversion_status(session_id, data)
+
+# In-memory fallback for conversion status if Redis is not available
 conversion_status = {}
 
 # HTML template
@@ -299,7 +356,7 @@ HTML_TEMPLATE = '''
     
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // Session ID storage
+        // Session ID storage - both in session and localStorage for resilience
         let currentSessionId = '';
         
         // Handle form submission for file upload
@@ -338,8 +395,11 @@ HTML_TEMPLATE = '''
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
-                    // Store session ID and start polling
+                    // Store session ID in both variables and localStorage for resilience
                     currentSessionId = data.session_id;
+                    localStorage.setItem('conversionSessionId', data.session_id);
+                    
+                    // Start polling for status updates
                     pollStatus(data.session_id);
                     
                     // Log initial status
@@ -375,78 +435,147 @@ HTML_TEMPLATE = '''
         }
         
         function pollStatus(sessionId) {
-            fetch(`/status/${sessionId}`, {
-                credentials: 'same-origin'  // Important for session cookies
-            })
-            .then(response => response.json())
-            .then(data => {
-                // Check if session is valid
-                if (data.message === 'Invalid session ID') {
-                    // Try to recover
-                    document.getElementById('statusMessage').innerText = 'Session error. Please try again.';
-                    document.getElementById('progressBar').style.width = '100%';
-                    document.getElementById('progressBar').classList.remove('bg-info', 'bg-success');
-                    document.getElementById('progressBar').classList.add('bg-danger');
-                    document.getElementById('uploadSubmitBtn').disabled = false;
-                    document.getElementById('uploadSubmitBtn').innerHTML = 'Try Again';
-                    document.getElementById('pasteSubmitBtn').disabled = false;
-                    document.getElementById('pasteSubmitBtn').innerHTML = 'Try Again';
+            // Try up to 10 times with increasing delays if there's an error
+            let retryCount = 0;
+            let maxRetries = 10;
+            let retryDelay = 1000;
+            
+            function makeStatusRequest() {
+                fetch(`/status/${sessionId}`, {
+                    credentials: 'same-origin'  // Important for session cookies
+                })
+                .then(response => response.json())
+                .then(data => {
+                    // Reset retry counter on successful response
+                    retryCount = 0;
                     
-                    const logElement = document.getElementById('logContent');
-                    logElement.innerHTML += `<div class="text-danger">[${new Date().toLocaleTimeString()}] Session error: Invalid session ID</div>`;
-                    return;
-                }
-                
-                // Update progress bar
-                document.getElementById('progressBar').style.width = data.progress + '%';
-                
-                // Update status message
-                document.getElementById('statusMessage').innerText = data.status;
-                
-                // Update log content
-                if (data.log) {
-                    const logElement = document.getElementById('logContent');
-                    logElement.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${data.log}</div>`;
-                    logElement.scrollTop = logElement.scrollHeight;
-                }
-                
-                if (data.completed) {
-                    if (data.success) {
-                        // Show success and download link
-                        document.getElementById('progressBar').classList.add('bg-success');
-                        document.getElementById('conversionStatus').innerHTML = `
-                            <div class="alert alert-success mt-3">
-                                <h5>Conversion successful!</h5>
-                                <p>Your executable has been created successfully.</p>
-                                <a href="${data.download_url}" class="btn btn-success">Download EXE</a>
-                            </div>
-                        `;
-                    } else {
-                        // Show error
+                    // Check if session is valid
+                    if (data.message === 'Invalid session ID') {
+                        const logElement = document.getElementById('logContent');
+                        logElement.innerHTML += `<div class="text-warning">[${new Date().toLocaleTimeString()}] Session error: Invalid session ID. Attempting recovery...</div>`;
+                        
+                        // Try to recover by using localStorage
+                        const storedSessionId = localStorage.getItem('conversionSessionId');
+                        if (storedSessionId && storedSessionId !== sessionId) {
+                            logElement.innerHTML += `<div>[${new Date().toLocaleTimeString()}] Attempting to recover with stored session ID: ${storedSessionId}</div>`;
+                            setTimeout(() => pollStatus(storedSessionId), 1000);
+                            return;
+                        }
+                        
+                        // If unable to recover, show error
+                        document.getElementById('statusMessage').innerText = 'Session error. Please try again.';
                         document.getElementById('progressBar').style.width = '100%';
-                        document.getElementById('progressBar').classList.remove('bg-info');
+                        document.getElementById('progressBar').classList.remove('bg-info', 'bg-success');
                         document.getElementById('progressBar').classList.add('bg-danger');
-                        document.getElementById('statusMessage').innerText = 'Error: ' + data.message;
                         document.getElementById('uploadSubmitBtn').disabled = false;
                         document.getElementById('uploadSubmitBtn').innerHTML = 'Try Again';
                         document.getElementById('pasteSubmitBtn').disabled = false;
                         document.getElementById('pasteSubmitBtn').innerHTML = 'Try Again';
+                        return;
                     }
-                } else {
-                    // Continue polling
-                    setTimeout(() => pollStatus(sessionId), 1000);
-                }
-            })
-            .catch(error => {
-                console.error('Error polling status:', error);
-                
-                const logElement = document.getElementById('logContent');
-                logElement.innerHTML += `<div class="text-warning">[${new Date().toLocaleTimeString()}] Network error while checking status: ${error.message}. Retrying...</div>`;
-                
-                // Retry with longer delay
-                setTimeout(() => pollStatus(sessionId), 2000);
-            });
+                    
+                    // Update progress bar
+                    document.getElementById('progressBar').style.width = data.progress + '%';
+                    
+                    // Update status message
+                    document.getElementById('statusMessage').innerText = data.status;
+                    
+                    // Update log content
+                    if (data.log) {
+                        const logElement = document.getElementById('logContent');
+                        logElement.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${data.log}</div>`;
+                        logElement.scrollTop = logElement.scrollHeight;
+                    }
+                    
+                    if (data.completed) {
+                        if (data.success) {
+                            // Show success and download link
+                            document.getElementById('progressBar').classList.add('bg-success');
+                            document.getElementById('conversionStatus').innerHTML = `
+                                <div class="alert alert-success mt-3">
+                                    <h5>Conversion successful!</h5>
+                                    <p>Your executable has been created successfully.</p>
+                                    <a href="${data.download_url}" class="btn btn-success">Download EXE</a>
+                                </div>
+                            `;
+                        } else {
+                            // Show error
+                            document.getElementById('progressBar').style.width = '100%';
+                            document.getElementById('progressBar').classList.remove('bg-info');
+                            document.getElementById('progressBar').classList.add('bg-danger');
+                            document.getElementById('statusMessage').innerText = 'Error: ' + data.message;
+                            document.getElementById('uploadSubmitBtn').disabled = false;
+                            document.getElementById('uploadSubmitBtn').innerHTML = 'Try Again';
+                            document.getElementById('pasteSubmitBtn').disabled = false;
+                            document.getElementById('pasteSubmitBtn').innerHTML = 'Try Again';
+                        }
+                    } else {
+                        // Continue polling
+                        setTimeout(() => makeStatusRequest(), 1000);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error polling status:', error);
+                    
+                    const logElement = document.getElementById('logContent');
+                    logElement.innerHTML += `<div class="text-warning">[${new Date().toLocaleTimeString()}] Network error while checking status: ${error.message}. Retrying...</div>`;
+                    
+                    // Implement exponential backoff for retries
+                    retryCount++;
+                    if (retryCount <= maxRetries) {
+                        setTimeout(() => makeStatusRequest(), retryDelay);
+                        retryDelay = Math.min(retryDelay * 1.5, 10000); // Cap at 10 seconds
+                    } else {
+                        logElement.innerHTML += `<div class="text-danger">[${new Date().toLocaleTimeString()}] Failed to connect after ${maxRetries} attempts. Please refresh and try again.</div>`;
+                        document.getElementById('statusMessage').innerText = 'Connection lost. Please refresh and try again.';
+                    }
+                });
+            }
+            
+            // Start the polling
+            makeStatusRequest();
         }
+        
+        // Check for ongoing conversion on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            const storedSessionId = localStorage.getItem('conversionSessionId');
+            if (storedSessionId) {
+                // Check if the stored session is still active
+                fetch(`/status/${storedSessionId}`, {
+                    credentials: 'same-origin'
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.message !== 'Invalid session ID' && !data.completed) {
+                        // Conversion is still in progress, restore UI
+                        document.getElementById('conversionStatus').style.display = 'block';
+                        document.getElementById('uploadSubmitBtn').disabled = true;
+                        document.getElementById('uploadSubmitBtn').innerHTML = 'Converting... Please wait';
+                        document.getElementById('pasteSubmitBtn').disabled = true;
+                        document.getElementById('pasteSubmitBtn').innerHTML = 'Converting... Please wait';
+                        
+                        const logElement = document.getElementById('logContent');
+                        logElement.innerHTML += `<div>[${new Date().toLocaleTimeString()}] Reconnected to conversion session: ${storedSessionId}</div>`;
+                        
+                        // Resume polling
+                        pollStatus(storedSessionId);
+                    } else if (data.completed && data.success) {
+                        // Conversion is complete, show download link
+                        document.getElementById('conversionStatus').style.display = 'block';
+                        document.getElementById('conversionStatus').innerHTML = `
+                            <div class="alert alert-success mt-3">
+                                <h5>Conversion successful!</h5>
+                                <p>Your executable is ready for download.</p>
+                                <a href="${data.download_url}" class="btn btn-success">Download EXE</a>
+                            </div>
+                        `;
+                    }
+                })
+                .catch(error => {
+                    console.error('Error checking stored session:', error);
+                });
+            }
+        });
         
         // Add window beforeunload event to warn about leaving during conversion
         window.addEventListener('beforeunload', function(e) {
@@ -491,7 +620,7 @@ def upload_file():
         logger.info(f"Created new session: {session_id}")
         
         # Initialize status
-        conversion_status[session_id] = {
+        initial_status = {
             'progress': 0,
             'status': 'Initializing...',
             'completed': False,
@@ -501,6 +630,7 @@ def upload_file():
             'download_url': None,
             'timestamp': time.time()
         }
+        set_conversion_status(session_id, initial_status)
         
         # Create work directory
         work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
@@ -570,7 +700,7 @@ def paste_code():
         logger.info(f"Created new session from pasted code: {session_id}")
         
         # Initialize status
-        conversion_status[session_id] = {
+        initial_status = {
             'progress': 0,
             'status': 'Initializing...',
             'completed': False,
@@ -580,6 +710,7 @@ def paste_code():
             'download_url': None,
             'timestamp': time.time()
         }
+        set_conversion_status(session_id, initial_status)
         
         # Create work directory
         work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
@@ -620,33 +751,29 @@ def paste_code():
         logger.error(f"Error initiating conversion from pasted code: {str(e)}")
         return jsonify(success=False, message=f'Error: {str(e)}')
 
-def update_status(session_id, progress=None, status=None, completed=None, success=None, message=None, log=None, download_url=None):
-    """Update the conversion status for a session"""
-    if session_id in conversion_status:
-        if progress is not None:
-            conversion_status[session_id]['progress'] = progress
-        if status is not None:
-            conversion_status[session_id]['status'] = status
-        if completed is not None:
-            conversion_status[session_id]['completed'] = completed
-        if success is not None:
-            conversion_status[session_id]['success'] = success
-        if message is not None:
-            conversion_status[session_id]['message'] = message
-        if log is not None:
-            conversion_status[session_id]['log'].append(log)
-            logger.info(f"Session {session_id}: {log}")
-        if download_url is not None:
-            conversion_status[session_id]['download_url'] = download_url
-
 @app.route('/status/<session_id>')
 def get_status(session_id):
     """Get the current conversion status"""
     logger.info(f"Status requested for session: {session_id}")
-    logger.info(f"Current sessions: {list(conversion_status.keys())}")
-    logger.info(f"Flask session ID: {session.get('session_id')}")
     
-    if session_id not in conversion_status:
+    # Try to get status from Redis/memory
+    status = get_conversion_status(session_id)
+    
+    if not status:
+        # Check if the session directory exists as fallback
+        work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
+        if os.path.exists(work_dir):
+            logger.info(f"Session directory exists but no status found: {session_id}")
+            # Return a generic status
+            return jsonify(
+                progress=50,
+                status='Processing conversion...',
+                completed=False,
+                success=False,
+                message='',
+                log='Reconnected to existing conversion process'
+            )
+        
         logger.warning(f"Session ID not found: {session_id}")
         return jsonify(
             progress=0,
@@ -657,7 +784,6 @@ def get_status(session_id):
             log=None
         )
     
-    status = conversion_status[session_id]
     # Only return the latest log entry
     latest_log = status['log'][-1] if status['log'] else None
     
@@ -674,14 +800,14 @@ def get_status(session_id):
 def convert_in_background(session_id, options):
     """Run the conversion process in a background thread"""
     try:
-        update_status(session_id, progress=5, status='Installing dependencies...')
+        update_conversion_status(session_id, progress=5, status='Installing dependencies...')
         
         # Install required packages
         if options['packages']:
             pkg_list = [pkg.strip() for pkg in options['packages'].split(',')]
             for pkg in pkg_list:
                 if pkg:
-                    update_status(session_id, status=f'Installing package: {pkg}')
+                    update_conversion_status(session_id, status=f'Installing package: {pkg}')
                     try:
                         subprocess.run(
                             [sys.executable, '-m', 'pip', 'install', pkg],
@@ -689,11 +815,11 @@ def convert_in_background(session_id, options):
                             capture_output=True,
                             timeout=120
                         )
-                        update_status(session_id, log=f'Successfully installed {pkg}')
+                        update_conversion_status(session_id, log=f'Successfully installed {pkg}')
                     except Exception as e:
-                        update_status(session_id, log=f'Warning: Failed to install {pkg}: {str(e)}')
+                        update_conversion_status(session_id, log=f'Warning: Failed to install {pkg}: {str(e)}')
         
-        update_status(session_id, progress=15, status='Building PyInstaller command...')
+        update_conversion_status(session_id, progress=15, status='Building PyInstaller command...')
         
         # Build PyInstaller command
         pyinstaller_cmd = ['pyinstaller']
@@ -731,7 +857,7 @@ def convert_in_background(session_id, options):
         pyinstaller_cmd.append(options['file_path'])
         
         # Run PyInstaller
-        update_status(
+        update_conversion_status(
             session_id, 
             progress=25, 
             status='Running PyInstaller...',
@@ -754,13 +880,13 @@ def convert_in_background(session_id, options):
             # Log important output
             for line in stdout.split('\n'):
                 if line.strip() and ('error' in line.lower() or 'warning' in line.lower() or 'info:' in line.lower()):
-                    update_status(session_id, log=line.strip())
+                    update_conversion_status(session_id, log=line.strip())
                     
             for line in stderr.split('\n'):
                 if line.strip():
-                    update_status(session_id, log=line.strip())
+                    update_conversion_status(session_id, log=line.strip())
                     
-            update_status(session_id, progress=75, status='Processing output...')
+            update_conversion_status(session_id, progress=75, status='Processing output...')
             
             # Determine output path
             script_name = os.path.splitext(os.path.basename(options['file_path']))[0]
@@ -775,7 +901,7 @@ def convert_in_background(session_id, options):
             else:
                 exe_path = os.path.join(options['work_dir'], 'dist', script_name, script_name + exe_extension)
             
-            update_status(session_id, progress=85, status='Packaging results...')
+            update_conversion_status(session_id, progress=85, status='Packaging results...')
             
             # Create a zip if there are multiple files or extra files
             if not options['one_file'] or options['extra_files']:
@@ -812,7 +938,7 @@ def convert_in_background(session_id, options):
                     filename=download_filename
                 )
                 
-                update_status(
+                update_conversion_status(
                     session_id,
                     progress=100,
                     status='Conversion completed successfully!',
@@ -822,7 +948,7 @@ def convert_in_background(session_id, options):
                     download_url=download_url
                 )
             else:
-                update_status(
+                update_conversion_status(
                     session_id,
                     progress=100,
                     status='Conversion failed',
@@ -832,7 +958,7 @@ def convert_in_background(session_id, options):
                 )
                 
         except subprocess.TimeoutExpired:
-            update_status(
+            update_conversion_status(
                 session_id,
                 progress=100,
                 status='Conversion failed',
@@ -842,7 +968,7 @@ def convert_in_background(session_id, options):
             )
         except subprocess.CalledProcessError as e:
             error_message = e.stderr.decode() if e.stderr else str(e)
-            update_status(
+            update_conversion_status(
                 session_id,
                 progress=100,
                 status='Conversion failed',
@@ -853,7 +979,7 @@ def convert_in_background(session_id, options):
     
     except Exception as e:
         logger.error(f"Error during conversion: {str(e)}")
-        update_status(
+        update_conversion_status(
             session_id,
             progress=100,
             status='Conversion failed',
@@ -865,7 +991,6 @@ def convert_in_background(session_id, options):
 @app.route('/download/<session_id>/<filename>')
 def download_file(session_id, filename):
     logger.info(f"Download requested: {session_id}/{filename}")
-    logger.info(f"Current session ID: {session.get('session_id')}")
     
     # More permissive approach for downloads to prevent session issues
     work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
@@ -884,21 +1009,31 @@ def download_file(session_id, filename):
 
 @app.route('/cleanup/<session_id>')
 def cleanup(session_id):
-    if session_id in conversion_status:
-        work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
-        if os.path.exists(work_dir):
-            try:
-                shutil.rmtree(work_dir)
-                logger.info(f"Cleaned up session directory: {session_id}")
-            except Exception as e:
-                logger.error(f"Error cleaning up directory for session {session_id}: {str(e)}")
-        
-        # Clean up status dictionary
+    # Try to get status from Redis
+    status = get_conversion_status(session_id)
+    
+    # Remove the work directory if it exists
+    work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
+    if os.path.exists(work_dir):
         try:
+            shutil.rmtree(work_dir)
+            logger.info(f"Cleaned up session directory: {session_id}")
+        except Exception as e:
+            logger.error(f"Error cleaning up directory for session {session_id}: {str(e)}")
+    
+    # If using Redis, delete the key
+    if redis_url:
+        try:
+            r = redis.from_url(redis_url)
+            r.delete(f'conversion_status:{session_id}')
+            logger.info(f"Removed session from Redis: {session_id}")
+        except Exception as e:
+            logger.error(f"Error removing session from Redis: {str(e)}")
+    else:
+        # If using memory, remove from dict
+        if session_id in conversion_status:
             del conversion_status[session_id]
-            logger.info(f"Removed session from status tracker: {session_id}")
-        except KeyError:
-            logger.warning(f"Session {session_id} not found in status tracker")
+            logger.info(f"Removed session from memory tracker: {session_id}")
     
     # Clear session cookie
     session.clear()
@@ -916,12 +1051,17 @@ def cleanup_old_sessions():
         try:
             current_time = time.time()
             
-            # Clean up old status entries
-            session_ids = list(conversion_status.keys())
-            for session_id in session_ids:
-                if conversion_status[session_id]['completed'] and current_time - conversion_status[session_id].get('timestamp', 0) > 3600:
-                    del conversion_status[session_id]
-                    logger.info(f"Cleaned up old session from status tracker: {session_id}")
+            # Clean up old status entries in Redis
+            if redis_url:
+                r = redis.from_url(redis_url)
+                # Redis already handles expiration, nothing to do here
+            else:
+                # If using memory dict, clean up old entries
+                session_ids = list(conversion_status.keys())
+                for session_id in session_ids:
+                    if conversion_status[session_id]['completed'] and current_time - conversion_status[session_id].get('timestamp', 0) > 3600:
+                        del conversion_status[session_id]
+                        logger.info(f"Cleaned up old session from memory tracker: {session_id}")
             
             # Clean up old directories
             for item in os.listdir(app.config['UPLOAD_FOLDER']):
