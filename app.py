@@ -1,262 +1,486 @@
 import os
+import shutil
+import zipfile
+import subprocess
+import tempfile
+import uuid
+from flask import Flask, request, render_template_string, send_file, redirect, url_for, flash, session
+from werkzeug.utils import secure_filename
 import logging
-from flask import Flask, request, jsonify, redirect, url_for, Response
-
-from paypalserversdk.paypal_serversdk_client import PaypalServersdkClient
-from paypalserversdk.http.auth.o_auth_2 import ClientCredentialsAuthCredentials
-from paypalserversdk.exceptions.api_exception import ApiException
-from paypalserversdk.models.order_request import OrderRequest
-from paypalserversdk.models.purchase_unit_request import PurchaseUnitRequest
-from paypalserversdk.models.amount_with_breakdown import AmountWithBreakdown
-from paypalserversdk.models.checkout_payment_intent import CheckoutPaymentIntent
-from paypalserversdk.api_helper import ApiHelper
+from datetime import datetime
 
 app = Flask(__name__)
-# For Render, set a strong FLASK_SECRET_KEY as an environment variable
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'this_is_a_default_unsafe_secret_for_testing_only')
+app.secret_key = os.urandom(24)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
+app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp()
+app.config['ALLOWED_EXTENSIONS'] = {'py'}
 
-# --- DANGER: LIVE Credentials for Testing ONLY ---
-# REPLACE THE PLACEHOLDERS BELOW WITH YOUR ACTUAL LIVE CREDENTIALS
-# BEFORE DEPLOYING THIS TEST APP.
-PAYPAL_LIVE_CLIENT_ID = "AcmlO6PwqeILCKfPYKY-c4rapIApzXQJngzmYHPJjkVvIIWU0n4voHw_2mk0LTE7O6xf9247-SS3cc5s"
-PAYPAL_LIVE_CLIENT_SECRET = "EDFnMBY8LzfvtDC2c3QuvO0GipPELvXakSgdmsxeTkis1gBFswtPgHzSE4dI83RIoFEUWPzs1AHBpuh4"
-# --- End of DANGER section ---
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Your Provided LIVE Credentials (to be used in the placeholders above):
-# Client ID: AcmlO6PwqeILCKfPYKY-c4rapIApzXQJngzmYHPJjkVvIIWU0n4voHw_2mk0LTE7O6xf9247-SS3cc5s
-# Secret: EDFnMBY8LzfvtDC2c3QuvO0GipPELvXakSgdmsxeTkis1gBFswtPgHzSE4dI83RIoFEUWPzs1AHBpuh4
-
-orders_controller = None
-paypal_sdk_initialized = False
-
-if PAYPAL_LIVE_CLIENT_ID and PAYPAL_LIVE_CLIENT_ID != "YOUR_LIVE_CLIENT_ID_REPLACE_ME" and \
-   PAYPAL_LIVE_CLIENT_SECRET and PAYPAL_LIVE_CLIENT_SECRET != "YOUR_LIVE_CLIENT_SECRET_REPLACE_ME":
-    try:
-        paypal_client = PaypalServersdkClient(
-            client_credentials_auth_credentials=ClientCredentialsAuthCredentials(
-                o_auth_client_id=PAYPAL_LIVE_CLIENT_ID,
-                o_auth_client_secret=PAYPAL_LIVE_CLIENT_SECRET
-            )
-            # No explicit logging for this minimal test app
-        )
-        orders_controller = paypal_client.orders
-        paypal_sdk_initialized = True
-        logging.info("PayPal SDK Client initialized successfully for LIVE (Simple Test App).")
-    except Exception as e:
-        logging.error(f"Failed to initialize PayPal SDK Client (Simple Test App): {e}")
-else:
-    logging.error("FATAL: PayPal Live Client ID and/or Secret placeholders not replaced in app.py.")
-
-
-INDEX_HTML_TEMPLATE = """
+# HTML template
+HTML_TEMPLATE = '''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>PayPal 1 Cent Test (LIVE)</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Python to EXE Converter</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body {{ font-family: sans-serif; padding: 20px; background-color: #f4f4f4; }}
-        .container {{ background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }}
-        h1 {{ color: #333; }}
-        strong {{ color: red; }}
-        #paypal-button-container {{ margin-top: 20px; }}
-        #payment-status {{ margin-top:15px; font-weight: bold; }}
-        .error {{ color: red; }}
-        .success {{ color: green; }}
+        body {
+            background-color: #f8f9fa;
+            padding-top: 2rem;
+        }
+        .container {
+            max-width: 800px;
+            background-color: white;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        .form-container {
+            margin-bottom: 2rem;
+        }
+        .options-container {
+            margin-top: 1.5rem;
+        }
+        .status-container {
+            margin-top: 2rem;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 2rem;
+            font-size: 0.9rem;
+            color: #6c757d;
+        }
+        .progress {
+            display: none;
+            margin-top: 20px;
+        }
+        .log-container {
+            margin-top: 20px;
+            max-height: 300px;
+            overflow-y: auto;
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>PayPal 1 Cent Charge Test (LIVE)</h1>
-        <p>This will attempt to charge $0.01 USD using your LIVE PayPal credentials.</p>
-        <p><strong>Warning:</strong> This uses LIVE credentials. This is for a specific, isolated test. Delete this app and consider rotating keys after testing.</p>
+        <div class="header">
+            <h1>Advanced Python to EXE Converter</h1>
+            <p class="lead">Convert your Python scripts to executable files</p>
+        </div>
+        
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
 
-        <div id="paypal-button-container"></div>
-        <p id="payment-status"></p>
-        <a href="/">Try Again / Home</a>
+        <div class="form-container">
+            <form method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data" id="uploadForm">
+                <div class="mb-3">
+                    <label for="pyfile" class="form-label">Select Python file:</label>
+                    <input type="file" class="form-control" id="pyfile" name="file" accept=".py" required>
+                </div>
+                
+                <div class="options-container">
+                    <h5>Build Options</h5>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="oneFile" name="one_file" checked>
+                                <label class="form-check-label" for="oneFile">
+                                    One-file bundle
+                                </label>
+                            </div>
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="console" name="console" checked>
+                                <label class="form-check-label" for="console">
+                                    Console application
+                                </label>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="uac" name="uac">
+                                <label class="form-check-label" for="uac">
+                                    Request admin privileges
+                                </label>
+                            </div>
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="debug" name="debug">
+                                <label class="form-check-label" for="debug">
+                                    Debug mode
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3 mt-3">
+                        <label for="extraPackages" class="form-label">Additional packages (comma separated):</label>
+                        <input type="text" class="form-control" id="extraPackages" name="packages" placeholder="numpy,pandas,matplotlib">
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="extraFiles" class="form-label">Additional files (uploaded later):</label>
+                        <input type="file" class="form-control" id="extraFiles" name="extra_files" multiple>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="targetPlatform" class="form-label">Target Platform:</label>
+                        <select class="form-select" id="targetPlatform" name="platform">
+                            <option value="auto" selected>Auto-detect</option>
+                            <option value="windows">Windows</option>
+                            <option value="linux">Linux</option>
+                            <option value="macos">macOS</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <button type="submit" class="btn btn-primary w-100" id="submitBtn">Convert to EXE</button>
+            </form>
+            
+            <div class="progress">
+                <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%"></div>
+            </div>
+        </div>
+        
+        <div class="log-container" id="logContainer" style="display: none;">
+            <h5>Build Log:</h5>
+            <div id="logContent"></div>
+        </div>
+        
+        {% if download_link %}
+        <div class="status-container">
+            <div class="alert alert-success">
+                <h5>Conversion successful!</h5>
+                <p>Your executable has been created successfully.</p>
+                <a href="{{ download_link }}" class="btn btn-success">Download EXE</a>
+            </div>
+        </div>
+        {% endif %}
+        
+        <div class="footer">
+            <p>Advanced Python to EXE Converter © {{ current_year }}</p>
+            <p>Powered by PyInstaller</p>
+        </div>
     </div>
-
-    <script src="https://www.paypal.com/sdk/js?client-id={client_id}¤cy=USD"></script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        const paymentStatusEl = document.getElementById('payment-status');
-        const paypalButtonContainer = document.getElementById('paypal-button-container');
-        const clientIdFromTemplate = "{client_id}";
-
-        if (!clientIdFromTemplate || clientIdFromTemplate === "YOUR_LIVE_CLIENT_ID_REPLACE_ME") {{
-            paymentStatusEl.textContent = 'Error: PayPal Client ID not configured correctly in the HTML template.';
-            paymentStatusEl.className = 'error';
-            if (paypalButtonContainer) paypalButtonContainer.style.display = 'none';
-        }} else if (!{sdk_ready}) {{
-            paymentStatusEl.textContent = 'Error: PayPal SDK could not be initialized on the server. Check server logs and credentials.';
-            paymentStatusEl.className = 'error';
-            if (paypalButtonContainer) paypalButtonContainer.style.display = 'none';
-        }}
-        else {{
-            paypal.Buttons({{
-                createOrder: function(data, actions) {{
-                    paymentStatusEl.textContent = 'Creating order...';
-                    paymentStatusEl.className = '';
-                    return fetch('/create_order', {{
-                        method: 'POST'
-                    }})
-                    .then(res => {{
-                        if (!res.ok) {{
-                            return res.json().then(errData => {{
-                                const errMsg = (errData && errData.error) ? errData.error : 'Server error during order creation.';
-                                throw new Error(errMsg);
-                            }});
-                        }}
-                        return res.json();
-                    }})
-                    .then(order => {{
-                        if (order && order.id) {{
-                            paymentStatusEl.textContent = 'Order created (' + order.id + '). Redirecting to PayPal...';
-                            return order.id;
-                        }} else {{
-                            const errMsg = (order && order.error) ? order.error : 'Could not get order ID from server.';
-                            throw new Error(errMsg);
-                        }}
-                    }})
-                    .catch(err => {{
-                        console.error('Create Order Error:', err);
-                        paymentStatusEl.textContent = 'Error creating order: ' + err.message;
-                        paymentStatusEl.className = 'error';
-                        throw err;
-                    }});
-                }},
-                onApprove: function(data, actions) {{
-                    paymentStatusEl.textContent = 'Payment approved. Capturing payment...';
-                    paymentStatusEl.className = '';
-                    return fetch(`/capture_order/${{data.orderID}}`, {{
-                        method: 'POST'
-                    }})
-                    .then(res => {{
-                         if (!res.ok) {{
-                            return res.json().then(errData => {{
-                                const errMsg = (errData && errData.error) ? errData.error : 'Server error during payment capture.';
-                                throw new Error(errMsg);
-                            }});
-                        }}
-                        return res.json();
-                    }})
-                    .then(details => {{
-                        if (details && details.id && details.status === 'COMPLETED') {{
-                            paymentStatusEl.textContent = 'Payment successful! Order ID: ' + details.id + ', Status: ' + details.status;
-                            paymentStatusEl.className = 'success';
-                            window.location.href = `/success?orderID=${{details.id}}`;
-                        }} else {{
-                            const errMsg = (details && details.error) ? details.error : `Payment status not completed: ${(details && details.status)}`;
-                            paymentStatusEl.textContent = 'Capture issue: ' + errMsg;
-                            paymentStatusEl.className = 'error';
-                             window.location.href = `/cancel?orderID=${{data.orderID}}&error=capture_not_completed&status=${{(details ? details.status : 'unknown')}}`;
-                        }}
-                    }})
-                    .catch(err => {{
-                        console.error('Capture Order Error:', err);
-                        paymentStatusEl.textContent = 'Error capturing payment: ' + err.message;
-                        paymentStatusEl.className = 'error';
-                        window.location.href = `/cancel?orderID=${{data.orderID}}&error=capture_failed_exception`;
-                    }});
-                }},
-                onCancel: function(data) {{
-                    paymentStatusEl.textContent = 'Payment cancelled by user. Order ID: ' + data.orderID;
-                    paymentStatusEl.className = 'error';
-                    window.location.href = `/cancel?orderID=${{data.orderID}}`;
-                }},
-                onError: function(err) {{
-                    console.error('PayPal SDK Error:', err);
-                    paymentStatusEl.textContent = 'PayPal SDK Error: ' + (err.message || 'An unknown PayPal error occurred.');
-                    paymentStatusEl.className = 'error';
-                }}
-            }}).render('#paypal-button-container');
-        }}
+        document.getElementById('uploadForm').addEventListener('submit', function() {
+            document.querySelector('.progress').style.display = 'block';
+            document.getElementById('logContainer').style.display = 'block';
+            document.getElementById('submitBtn').disabled = true;
+            document.getElementById('submitBtn').innerHTML = 'Converting... Please wait';
+            
+            // Simulate progress updates (in a real app, this would be updated by server events)
+            let progress = 0;
+            const progressBar = document.querySelector('.progress-bar');
+            const logContent = document.getElementById('logContent');
+            
+            const updateProgress = () => {
+                if (progress < 90) {
+                    progress += Math.random() * 10;
+                    progressBar.style.width = progress + '%';
+                    
+                    // Add fake log messages
+                    const messages = [
+                        "Analyzing Python dependencies...",
+                        "Running PyInstaller...",
+                        "Collecting modules...",
+                        "Building EXE...",
+                        "Optimizing executable size...",
+                        "Packaging additional files...",
+                        "Finalizing build..."
+                    ];
+                    
+                    if (progress > 20 && progress < 80 && Math.random() > 0.7) {
+                        const logMsg = messages[Math.floor(Math.random() * messages.length)];
+                        logContent.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${logMsg}</div>`;
+                        logContent.scrollTop = logContent.scrollHeight;
+                    }
+                    
+                    setTimeout(updateProgress, 800);
+                }
+            };
+            
+            updateProgress();
+        });
     </script>
 </body>
 </html>
-"""
+'''
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
 @app.route('/')
 def index():
-    if not PAYPAL_LIVE_CLIENT_ID or PAYPAL_LIVE_CLIENT_ID == "YOUR_LIVE_CLIENT_ID_REPLACE_ME":
-        return "<h1>Configuration Error</h1><p>PayPal Client ID placeholder not replaced in server code. Please update app.py.</p>", 500
-    # Pass sdk_ready status to template
-    return Response(INDEX_HTML_TEMPLATE.format(client_id=PAYPAL_LIVE_CLIENT_ID, sdk_ready=str(paypal_sdk_initialized).lower()), mimetype='text/html')
+    return render_template_string(HTML_TEMPLATE, current_year=datetime.now().year, download_link=None)
 
-@app.route('/create_order', methods=['POST'])
-def create_order_api():
-    if not orders_controller:
-        return jsonify({"error": "PayPal SDK not initialized on server. Check credentials in app.py and server logs."}), 503
-
-    order_request = OrderRequest(
-        intent=CheckoutPaymentIntent.CAPTURE,
-        purchase_units=[
-            PurchaseUnitRequest(
-                amount=AmountWithBreakdown(currency_code="USD", value="0.01"), # 1 cent
-                description="Test 1 Cent Charge (LIVE)"
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    session_id = str(uuid.uuid4())
+    session['session_id'] = session_id
+    
+    work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
+    os.makedirs(work_dir, exist_ok=True)
+    
+    if 'file' not in request.files:
+        flash('No file part', 'danger')
+        return redirect(request.url)
+    
+    file = request.files['file']
+    if file.filename == '':
+        flash('No selected file', 'danger')
+        return redirect(request.url)
+    
+    if file and allowed_file(file.filename):
+        try:
+            # Save the main Python file
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(work_dir, filename)
+            file.save(file_path)
+            
+            # Save additional files if provided
+            extra_files_paths = []
+            if 'extra_files' in request.files:
+                extra_files = request.files.getlist('extra_files')
+                for extra_file in extra_files:
+                    if extra_file.filename != '':
+                        extra_filename = secure_filename(extra_file.filename)
+                        extra_file_path = os.path.join(work_dir, extra_filename)
+                        extra_file.save(extra_file_path)
+                        extra_files_paths.append(extra_file_path)
+            
+            # Get options
+            one_file = 'one_file' in request.form
+            console = 'console' in request.form
+            uac = 'uac' in request.form
+            debug = 'debug' in request.form
+            packages = request.form.get('packages', '')
+            platform = request.form.get('platform', 'auto')
+            
+            # Convert to executable
+            exe_path = convert_to_exe(
+                file_path, 
+                work_dir, 
+                one_file=one_file,
+                console=console,
+                uac=uac,
+                debug=debug,
+                packages=packages,
+                platform=platform
             )
-        ],
-        application_context={
-            "return_url": url_for('success_page', _external=True),
-            "cancel_url": url_for('cancel_page', _external=True),
-            "brand_name": "Live Test App",
-            "shipping_preference": "NO_SHIPPING",
-            "user_action": "PAY_NOW"
-        }
-    )
+            
+            if exe_path:
+                # Create a zip if there are multiple files
+                if not one_file:
+                    zip_path = os.path.join(work_dir, 'executable.zip')
+                    with zipfile.ZipFile(zip_path, 'w') as zipf:
+                        for root, dirs, files in os.walk(os.path.dirname(exe_path)):
+                            for file in files:
+                                zipf.write(
+                                    os.path.join(root, file),
+                                    os.path.relpath(os.path.join(root, file), os.path.dirname(work_dir))
+                                )
+                    download_path = zip_path
+                else:
+                    download_path = exe_path
+                
+                # Generate download link
+                download_url = url_for('download_file', session_id=session_id, 
+                                       filename=os.path.basename(download_path))
+                
+                return render_template_string(
+                    HTML_TEMPLATE, 
+                    current_year=datetime.now().year,
+                    download_link=download_url
+                )
+            else:
+                flash('Conversion failed. Check your script for errors.', 'danger')
+                return redirect(url_for('index'))
+                
+        except Exception as e:
+            logger.error(f"Error during conversion: {str(e)}")
+            flash(f'Error during conversion: {str(e)}', 'danger')
+            return redirect(url_for('index'))
+    else:
+        flash('Only Python (.py) files are allowed', 'warning')
+        return redirect(url_for('index'))
+
+def convert_to_exe(file_path, work_dir, one_file=True, console=True, uac=False, 
+                   debug=False, packages='', platform='auto'):
+    """
+    Convert Python script to executable using PyInstaller
+    """
     try:
-        response = orders_controller.create_order({'body': order_request})
-        if response.body and hasattr(response.body, 'id'):
-            return jsonify({"id": response.body.id})
+        # Install required packages
+        if packages:
+            pkg_list = [pkg.strip() for pkg in packages.split(',')]
+            for pkg in pkg_list:
+                if pkg:
+                    subprocess.run(
+                        [sys.executable, '-m', 'pip', 'install', pkg],
+                        check=True,
+                        capture_output=True
+                    )
+        
+        # Build PyInstaller command
+        pyinstaller_cmd = ['pyinstaller']
+        
+        if one_file:
+            pyinstaller_cmd.append('--onefile')
         else:
-            err_details = ApiHelper.json_serialize(response.body) if response.body else 'No Body from PayPal'
-            logging.error(f"Create order response invalid: Status {response.status_code}, Body: {err_details}")
-            return jsonify({"error": f"Failed to create order or get ID from PayPal. Details: {err_details}"}), 500
-    except ApiException as e:
-        logging.error(f"PayPal API Exception during order creation: Code: {e.status_code if hasattr(e, 'status_code') else 'N/A'}, Message: {str(e)}")
-        return jsonify({"error": f"PayPal API Error: {str(e)}"}), e.status_code if hasattr(e, 'status_code') else 500
+            pyinstaller_cmd.append('--onedir')
+            
+        if not console:
+            pyinstaller_cmd.append('--windowed')
+            
+        if uac and platform != 'linux':
+            pyinstaller_cmd.append('--uac-admin')
+            
+        if debug:
+            pyinstaller_cmd.append('--debug')
+            
+        # Set workdir and distpath
+        pyinstaller_cmd.extend(['--workpath', os.path.join(work_dir, 'build')])
+        pyinstaller_cmd.extend(['--distpath', os.path.join(work_dir, 'dist')])
+        pyinstaller_cmd.extend(['--specpath', work_dir])
+        
+        # Add platform if specified
+        if platform == 'windows':
+            pyinstaller_cmd.extend(['--target-architecture', 'x86_64-windows'])
+        elif platform == 'linux':
+            pyinstaller_cmd.extend(['--target-architecture', 'x86_64-linux'])
+        elif platform == 'macos':
+            pyinstaller_cmd.extend(['--target-architecture', 'x86_64-darwin'])
+            
+        # Finally, add the script path
+        pyinstaller_cmd.append(file_path)
+        
+        # Run PyInstaller
+        logger.info(f"Running PyInstaller with command: {' '.join(pyinstaller_cmd)}")
+        result = subprocess.run(
+            pyinstaller_cmd,
+            check=True,
+            capture_output=True,
+            cwd=work_dir
+        )
+        
+        logger.info(f"PyInstaller stdout: {result.stdout.decode()}")
+        logger.info(f"PyInstaller stderr: {result.stderr.decode()}")
+        
+        # Determine output path
+        script_name = os.path.splitext(os.path.basename(file_path))[0]
+        if platform == 'windows' or platform == 'auto' and os.name == 'nt':
+            exe_extension = '.exe'
+        else:
+            exe_extension = ''
+            
+        if one_file:
+            exe_path = os.path.join(work_dir, 'dist', script_name + exe_extension)
+        else:
+            if platform == 'windows' or platform == 'auto' and os.name == 'nt':
+                exe_path = os.path.join(work_dir, 'dist', script_name, script_name + exe_extension)
+            else:
+                exe_path = os.path.join(work_dir, 'dist', script_name, script_name)
+        
+        if os.path.exists(exe_path):
+            return exe_path
+        else:
+            logger.error(f"Executable not found at expected path: {exe_path}")
+            return None
+    
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error running PyInstaller: {e.stderr.decode() if e.stderr else str(e)}")
+        return None
     except Exception as e:
-        logging.error(f"General Exception during order creation: {e}", exc_info=True)
-        return jsonify({"error": f"Server Error during order creation: {str(e)}"}), 500
+        logger.error(f"Unexpected error during conversion: {str(e)}")
+        return None
 
-@app.route('/capture_order/<order_id>', methods=['POST'])
-def capture_order_api(order_id):
-    if not orders_controller:
-        return jsonify({"error": "PayPal SDK not initialized on server. Check credentials in app.py and server logs."}), 503
+@app.route('/download/<session_id>/<filename>')
+def download_file(session_id, filename):
+    if 'session_id' not in session or session['session_id'] != session_id:
+        flash('Invalid download session', 'danger')
+        return redirect(url_for('index'))
+    
+    work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
+    
+    if filename.endswith('.zip'):
+        file_path = os.path.join(work_dir, filename)
+    else:
+        file_path = os.path.join(work_dir, 'dist', filename)
+    
+    if not os.path.exists(file_path):
+        flash('File not found', 'danger')
+        return redirect(url_for('index'))
+        
+    return send_file(file_path, as_attachment=True)
+
+@app.route('/cleanup/<session_id>')
+def cleanup(session_id):
+    if 'session_id' in session and session['session_id'] == session_id:
+        work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
+        if os.path.exists(work_dir):
+            shutil.rmtree(work_dir)
+        session.pop('session_id', None)
+    
+    return redirect(url_for('index'))
+
+# Periodic cleanup task
+def cleanup_old_sessions():
+    import threading
+    import time
+    
+    while True:
+        try:
+            # Get all session directories
+            for item in os.listdir(app.config['UPLOAD_FOLDER']):
+                item_path = os.path.join(app.config['UPLOAD_FOLDER'], item)
+                if os.path.isdir(item_path):
+                    # Check if directory is older than 1 hour
+                    if time.time() - os.path.getmtime(item_path) > 3600:
+                        logger.info(f"Cleaning up old session: {item}")
+                        shutil.rmtree(item_path)
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+            
+        # Sleep for 15 minutes
+        time.sleep(900)
+
+# Start cleanup thread
+import threading
+import sys
+cleanup_thread = threading.Thread(target=cleanup_old_sessions, daemon=True)
+cleanup_thread.start()
+
+# Ensure PyInstaller is installed
+def ensure_pyinstaller():
     try:
-        # The SDK expects a dictionary with 'id' for named path parameters
-        response = orders_controller.capture_order({"id": order_id})
-        if response.body and hasattr(response.body, 'id') and hasattr(response.body, 'status'):
-             return jsonify({
-                "id": response.body.id,
-                "status": response.body.status,
-                "full_details_for_debug": ApiHelper.json_serialize(response.body)
-            })
-        else:
-            err_details = ApiHelper.json_serialize(response.body) if response.body else 'No Body from PayPal'
-            logging.error(f"Capture order response invalid for {order_id}: Status {response.status_code}, Body: {err_details}")
-            return jsonify({"error": f"Failed to capture payment or get valid details from PayPal. Details: {err_details}"}), 500
-    except ApiException as e:
-        logging.error(f"PayPal API Exception during order capture ({order_id}): Code: {e.status_code if hasattr(e, 'status_code') else 'N/A'}, Message: {str(e)}")
-        return jsonify({"error": f"PayPal API Error: {str(e)}"}), e.status_code if hasattr(e, 'status_code') else 500
-    except Exception as e:
-        logging.error(f"General Exception during order capture ({order_id}): {e}", exc_info=True)
-        return jsonify({"error": f"Server Error during payment capture: {str(e)}"}), 500
-
-@app.route('/success')
-def success_page():
-    order_id = request.args.get('orderID', 'N/A')
-    return f"<h1>Payment Successful!</h1><p>Order ID: {order_id}</p><p><a href='/'>Test Again</a></p>"
-
-@app.route('/cancel')
-def cancel_page():
-    order_id = request.args.get('orderID', 'N/A')
-    error_msg = request.args.get('error', 'User cancelled or payment failed.')
-    status_msg = request.args.get('status', '')
-    return f"<h1>Payment Cancelled or Failed</h1><p>Order ID: {order_id}</p><p>Reason: {error_msg}</p><p>Status: {status_msg}</p><p><a href='/'>Test Again</a></p>"
+        import PyInstaller
+    except ImportError:
+        subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', 'pyinstaller'],
+            check=True
+        )
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
-    port = int(os.environ.get('PORT', 5002)) # Render sets PORT
-    # For production on Render, FLASK_ENV=production is set, making debug False
-    is_production = os.environ.get("FLASK_ENV", "").lower() == "production"
-    app.run(host='0.0.0.0', port=port, debug=not is_production)
+    ensure_pyinstaller()
+    # For render.com deployment
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
