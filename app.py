@@ -1,10 +1,15 @@
+
 import os
 import shutil
 import zipfile
 import subprocess
 import tempfile
 import uuid
-from flask import Flask, request, render_template_string, send_file, redirect, url_for, flash, session
+import sys
+import threading
+import time
+import json
+from flask import Flask, request, render_template_string, send_file, redirect, url_for, flash, session, jsonify
 from werkzeug.utils import secure_filename
 import logging
 from datetime import datetime
@@ -15,9 +20,15 @@ app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
 app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp()
 app.config['ALLOWED_EXTENSIONS'] = {'py'}
 
+# Detect if running on Render
+ON_RENDER = 'RENDER' in os.environ
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Store conversion status
+conversion_status = {}
 
 # HTML template
 HTML_TEMPLATE = '''
@@ -60,7 +71,6 @@ HTML_TEMPLATE = '''
             color: #6c757d;
         }
         .progress {
-            display: none;
             margin-top: 20px;
         }
         .log-container {
@@ -71,6 +81,9 @@ HTML_TEMPLATE = '''
             padding: 10px;
             border-radius: 5px;
             font-family: monospace;
+        }
+        #statusMessage {
+            font-weight: bold;
         }
     </style>
 </head>
@@ -153,14 +166,20 @@ HTML_TEMPLATE = '''
                 <button type="submit" class="btn btn-primary w-100" id="submitBtn">Convert to EXE</button>
             </form>
             
-            <div class="progress">
-                <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%"></div>
+            <div id="conversionStatus" style="display: none;">
+                <div class="alert alert-info mt-3">
+                    <h5>Conversion in Progress</h5>
+                    <p id="statusMessage">Initializing conversion process...</p>
+                    <div class="progress">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%" id="progressBar"></div>
+                    </div>
+                </div>
+                
+                <div class="log-container">
+                    <h5>Build Log:</h5>
+                    <div id="logContent"></div>
+                </div>
             </div>
-        </div>
-        
-        <div class="log-container" id="logContainer" style="display: none;">
-            <h5>Build Log:</h5>
-            <div id="logContent"></div>
         </div>
         
         {% if download_link %}
@@ -181,45 +200,94 @@ HTML_TEMPLATE = '''
     
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        document.getElementById('uploadForm').addEventListener('submit', function() {
-            document.querySelector('.progress').style.display = 'block';
-            document.getElementById('logContainer').style.display = 'block';
+        document.getElementById('uploadForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            // Show progress UI
+            document.getElementById('conversionStatus').style.display = 'block';
             document.getElementById('submitBtn').disabled = true;
             document.getElementById('submitBtn').innerHTML = 'Converting... Please wait';
             
-            // Simulate progress updates (in a real app, this would be updated by server events)
-            let progress = 0;
-            const progressBar = document.querySelector('.progress-bar');
-            const logContent = document.getElementById('logContent');
-            
-            const updateProgress = () => {
-                if (progress < 90) {
-                    progress += Math.random() * 10;
-                    progressBar.style.width = progress + '%';
+            // Submit the form data via AJAX to start the conversion
+            const formData = new FormData(this);
+            fetch('{{ url_for('upload_file') }}', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    // Start polling for status updates
+                    const sessionId = data.session_id;
+                    pollStatus(sessionId);
+                } else {
+                    // Show error
+                    document.getElementById('statusMessage').innerText = 'Error: ' + data.message;
+                    document.getElementById('progressBar').style.width = '100%';
+                    document.getElementById('progressBar').classList.remove('bg-info', 'bg-success');
+                    document.getElementById('progressBar').classList.add('bg-danger');
+                    document.getElementById('submitBtn').disabled = false;
+                    document.getElementById('submitBtn').innerHTML = 'Try Again';
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                document.getElementById('statusMessage').innerText = 'Server error occurred. Please try again.';
+                document.getElementById('progressBar').style.width = '100%';
+                document.getElementById('progressBar').classList.remove('bg-info', 'bg-success');
+                document.getElementById('progressBar').classList.add('bg-danger');
+                document.getElementById('submitBtn').disabled = false;
+                document.getElementById('submitBtn').innerHTML = 'Try Again';
+            });
+        });
+        
+        function pollStatus(sessionId) {
+            fetch(`/status/${sessionId}`)
+                .then(response => response.json())
+                .then(data => {
+                    // Update progress bar
+                    document.getElementById('progressBar').style.width = data.progress + '%';
                     
-                    // Add fake log messages
-                    const messages = [
-                        "Analyzing Python dependencies...",
-                        "Running PyInstaller...",
-                        "Collecting modules...",
-                        "Building EXE...",
-                        "Optimizing executable size...",
-                        "Packaging additional files...",
-                        "Finalizing build..."
-                    ];
+                    // Update status message
+                    document.getElementById('statusMessage').innerText = data.status;
                     
-                    if (progress > 20 && progress < 80 && Math.random() > 0.7) {
-                        const logMsg = messages[Math.floor(Math.random() * messages.length)];
-                        logContent.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${logMsg}</div>`;
-                        logContent.scrollTop = logContent.scrollHeight;
+                    // Update log content
+                    if (data.log) {
+                        const logElement = document.getElementById('logContent');
+                        logElement.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${data.log}</div>`;
+                        logElement.scrollTop = logElement.scrollHeight;
                     }
                     
-                    setTimeout(updateProgress, 800);
-                }
-            };
-            
-            updateProgress();
-        });
+                    if (data.completed) {
+                        if (data.success) {
+                            // Show success and download link
+                            document.getElementById('progressBar').classList.add('bg-success');
+                            document.getElementById('conversionStatus').innerHTML = `
+                                <div class="alert alert-success mt-3">
+                                    <h5>Conversion successful!</h5>
+                                    <p>Your executable has been created successfully.</p>
+                                    <a href="${data.download_url}" class="btn btn-success">Download EXE</a>
+                                </div>
+                            `;
+                        } else {
+                            // Show error
+                            document.getElementById('progressBar').style.width = '100%';
+                            document.getElementById('progressBar').classList.remove('bg-info');
+                            document.getElementById('progressBar').classList.add('bg-danger');
+                            document.getElementById('statusMessage').innerText = 'Error: ' + data.message;
+                            document.getElementById('submitBtn').disabled = false;
+                            document.getElementById('submitBtn').innerHTML = 'Try Again';
+                        }
+                    } else {
+                        // Continue polling
+                        setTimeout(() => pollStatus(sessionId), 1000);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error polling status:', error);
+                    setTimeout(() => pollStatus(sessionId), 2000); // Retry with longer delay
+                });
+        }
     </script>
 </body>
 </html>
@@ -234,184 +302,314 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    session_id = str(uuid.uuid4())
-    session['session_id'] = session_id
-    
-    work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
-    os.makedirs(work_dir, exist_ok=True)
-    
     if 'file' not in request.files:
-        flash('No file part', 'danger')
-        return redirect(request.url)
+        return jsonify(success=False, message='No file part')
     
     file = request.files['file']
     if file.filename == '':
-        flash('No selected file', 'danger')
-        return redirect(request.url)
+        return jsonify(success=False, message='No selected file')
     
-    if file and allowed_file(file.filename):
-        try:
-            # Save the main Python file
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(work_dir, filename)
-            file.save(file_path)
-            
-            # Save additional files if provided
-            extra_files_paths = []
-            if 'extra_files' in request.files:
-                extra_files = request.files.getlist('extra_files')
-                for extra_file in extra_files:
-                    if extra_file.filename != '':
-                        extra_filename = secure_filename(extra_file.filename)
-                        extra_file_path = os.path.join(work_dir, extra_filename)
-                        extra_file.save(extra_file_path)
-                        extra_files_paths.append(extra_file_path)
-            
-            # Get options
-            one_file = 'one_file' in request.form
-            console = 'console' in request.form
-            uac = 'uac' in request.form
-            debug = 'debug' in request.form
-            packages = request.form.get('packages', '')
-            platform = request.form.get('platform', 'auto')
-            
-            # Convert to executable
-            exe_path = convert_to_exe(
-                file_path, 
-                work_dir, 
-                one_file=one_file,
-                console=console,
-                uac=uac,
-                debug=debug,
-                packages=packages,
-                platform=platform
-            )
-            
-            if exe_path:
-                # Create a zip if there are multiple files
-                if not one_file:
-                    zip_path = os.path.join(work_dir, 'executable.zip')
-                    with zipfile.ZipFile(zip_path, 'w') as zipf:
-                        for root, dirs, files in os.walk(os.path.dirname(exe_path)):
-                            for file in files:
-                                zipf.write(
-                                    os.path.join(root, file),
-                                    os.path.relpath(os.path.join(root, file), os.path.dirname(work_dir))
-                                )
-                    download_path = zip_path
-                else:
-                    download_path = exe_path
-                
-                # Generate download link
-                download_url = url_for('download_file', session_id=session_id, 
-                                       filename=os.path.basename(download_path))
-                
-                return render_template_string(
-                    HTML_TEMPLATE, 
-                    current_year=datetime.now().year,
-                    download_link=download_url
-                )
-            else:
-                flash('Conversion failed. Check your script for errors.', 'danger')
-                return redirect(url_for('index'))
-                
-        except Exception as e:
-            logger.error(f"Error during conversion: {str(e)}")
-            flash(f'Error during conversion: {str(e)}', 'danger')
-            return redirect(url_for('index'))
-    else:
-        flash('Only Python (.py) files are allowed', 'warning')
-        return redirect(url_for('index'))
-
-def convert_to_exe(file_path, work_dir, one_file=True, console=True, uac=False, 
-                   debug=False, packages='', platform='auto'):
-    """
-    Convert Python script to executable using PyInstaller
-    """
+    if not file or not allowed_file(file.filename):
+        return jsonify(success=False, message='Only Python (.py) files are allowed')
+    
     try:
+        # Create session ID
+        session_id = str(uuid.uuid4())
+        session['session_id'] = session_id
+        
+        # Initialize status
+        conversion_status[session_id] = {
+            'progress': 0,
+            'status': 'Initializing...',
+            'completed': False,
+            'success': False,
+            'message': '',
+            'log': [],
+            'download_url': None
+        }
+        
+        # Create work directory
+        work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
+        os.makedirs(work_dir, exist_ok=True)
+        
+        # Save the main Python file
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(work_dir, filename)
+        file.save(file_path)
+        
+        # Save additional files if provided
+        extra_files_paths = []
+        if 'extra_files' in request.files:
+            extra_files = request.files.getlist('extra_files')
+            for extra_file in extra_files:
+                if extra_file.filename != '':
+                    extra_filename = secure_filename(extra_file.filename)
+                    extra_file_path = os.path.join(work_dir, extra_filename)
+                    extra_file.save(extra_file_path)
+                    extra_files_paths.append(extra_file_path)
+        
+        # Get options
+        options = {
+            'one_file': 'one_file' in request.form,
+            'console': 'console' in request.form,
+            'uac': 'uac' in request.form,
+            'debug': 'debug' in request.form,
+            'packages': request.form.get('packages', ''),
+            'platform': request.form.get('platform', 'auto'),
+            'file_path': file_path,
+            'work_dir': work_dir,
+            'extra_files': extra_files_paths
+        }
+        
+        # Start conversion in background thread
+        thread = threading.Thread(
+            target=convert_in_background,
+            args=(session_id, options),
+            daemon=True
+        )
+        thread.start()
+        
+        return jsonify(success=True, message='Conversion started', session_id=session_id)
+        
+    except Exception as e:
+        logger.error(f"Error initiating conversion: {str(e)}")
+        return jsonify(success=False, message=f'Error: {str(e)}')
+
+def update_status(session_id, progress=None, status=None, completed=None, success=None, message=None, log=None, download_url=None):
+    """Update the conversion status for a session"""
+    if session_id in conversion_status:
+        if progress is not None:
+            conversion_status[session_id]['progress'] = progress
+        if status is not None:
+            conversion_status[session_id]['status'] = status
+        if completed is not None:
+            conversion_status[session_id]['completed'] = completed
+        if success is not None:
+            conversion_status[session_id]['success'] = success
+        if message is not None:
+            conversion_status[session_id]['message'] = message
+        if log is not None:
+            conversion_status[session_id]['log'].append(log)
+        if download_url is not None:
+            conversion_status[session_id]['download_url'] = download_url
+
+@app.route('/status/<session_id>')
+def get_status(session_id):
+    """Get the current conversion status"""
+    if session_id not in conversion_status:
+        return jsonify(
+            progress=0,
+            status='Session not found',
+            completed=True,
+            success=False,
+            message='Invalid session ID',
+            log=None
+        )
+    
+    status = conversion_status[session_id]
+    # Only return the latest log entry
+    latest_log = status['log'][-1] if status['log'] else None
+    
+    return jsonify(
+        progress=status['progress'],
+        status=status['status'],
+        completed=status['completed'],
+        success=status['success'],
+        message=status['message'],
+        log=latest_log,
+        download_url=status['download_url']
+    )
+
+def convert_in_background(session_id, options):
+    """Run the conversion process in a background thread"""
+    try:
+        update_status(session_id, progress=5, status='Installing dependencies...')
+        
         # Install required packages
-        if packages:
-            pkg_list = [pkg.strip() for pkg in packages.split(',')]
+        if options['packages']:
+            pkg_list = [pkg.strip() for pkg in options['packages'].split(',')]
             for pkg in pkg_list:
                 if pkg:
-                    subprocess.run(
-                        [sys.executable, '-m', 'pip', 'install', pkg],
-                        check=True,
-                        capture_output=True
-                    )
+                    update_status(session_id, status=f'Installing package: {pkg}')
+                    try:
+                        subprocess.run(
+                            [sys.executable, '-m', 'pip', 'install', pkg],
+                            check=True,
+                            capture_output=True,
+                            timeout=120
+                        )
+                        update_status(session_id, log=f'Successfully installed {pkg}')
+                    except Exception as e:
+                        update_status(session_id, log=f'Warning: Failed to install {pkg}: {str(e)}')
+        
+        update_status(session_id, progress=15, status='Building PyInstaller command...')
         
         # Build PyInstaller command
         pyinstaller_cmd = ['pyinstaller']
         
-        if one_file:
+        if options['one_file']:
             pyinstaller_cmd.append('--onefile')
         else:
             pyinstaller_cmd.append('--onedir')
             
-        if not console:
+        if not options['console']:
             pyinstaller_cmd.append('--windowed')
             
-        if uac and platform != 'linux':
+        # Only use UAC for Windows and not on Render
+        if options['uac'] and options['platform'] == 'windows' and not ON_RENDER:
             pyinstaller_cmd.append('--uac-admin')
             
-        if debug:
+        if options['debug']:
             pyinstaller_cmd.append('--debug')
             
         # Set workdir and distpath
-        pyinstaller_cmd.extend(['--workpath', os.path.join(work_dir, 'build')])
-        pyinstaller_cmd.extend(['--distpath', os.path.join(work_dir, 'dist')])
-        pyinstaller_cmd.extend(['--specpath', work_dir])
+        pyinstaller_cmd.extend(['--workpath', os.path.join(options['work_dir'], 'build')])
+        pyinstaller_cmd.extend(['--distpath', os.path.join(options['work_dir'], 'dist')])
+        pyinstaller_cmd.extend(['--specpath', options['work_dir']])
         
-        # Add platform if specified
-        if platform == 'windows':
-            pyinstaller_cmd.extend(['--target-architecture', 'x86_64-windows'])
-        elif platform == 'linux':
-            pyinstaller_cmd.extend(['--target-architecture', 'x86_64-linux'])
-        elif platform == 'macos':
-            pyinstaller_cmd.extend(['--target-architecture', 'x86_64-darwin'])
+        # Add target architecture only if not on Render
+        if not ON_RENDER:
+            if options['platform'] == 'windows':
+                pyinstaller_cmd.extend(['--target-architecture', 'x86_64-windows'])
+            elif options['platform'] == 'linux':
+                pyinstaller_cmd.extend(['--target-architecture', 'x86_64-linux'])
+            elif options['platform'] == 'macos':
+                pyinstaller_cmd.extend(['--target-architecture', 'x86_64-darwin'])
             
         # Finally, add the script path
-        pyinstaller_cmd.append(file_path)
+        pyinstaller_cmd.append(options['file_path'])
         
         # Run PyInstaller
-        logger.info(f"Running PyInstaller with command: {' '.join(pyinstaller_cmd)}")
-        result = subprocess.run(
-            pyinstaller_cmd,
-            check=True,
-            capture_output=True,
-            cwd=work_dir
+        update_status(
+            session_id, 
+            progress=25, 
+            status='Running PyInstaller...',
+            log=f"Command: {' '.join(pyinstaller_cmd)}"
         )
         
-        logger.info(f"PyInstaller stdout: {result.stdout.decode()}")
-        logger.info(f"PyInstaller stderr: {result.stderr.decode()}")
-        
-        # Determine output path
-        script_name = os.path.splitext(os.path.basename(file_path))[0]
-        if platform == 'windows' or platform == 'auto' and os.name == 'nt':
-            exe_extension = '.exe'
-        else:
-            exe_extension = ''
+        try:
+            # Run with a timeout to prevent hanging
+            result = subprocess.run(
+                pyinstaller_cmd,
+                check=True,
+                capture_output=True,
+                cwd=options['work_dir'],
+                timeout=240  # 4 minutes timeout
+            )
             
-        if one_file:
-            exe_path = os.path.join(work_dir, 'dist', script_name + exe_extension)
-        else:
-            if platform == 'windows' or platform == 'auto' and os.name == 'nt':
-                exe_path = os.path.join(work_dir, 'dist', script_name, script_name + exe_extension)
+            stdout = result.stdout.decode()
+            stderr = result.stderr.decode()
+            
+            # Log important output
+            for line in stdout.split('\n'):
+                if line.strip() and ('error' in line.lower() or 'warning' in line.lower() or 'info:' in line.lower()):
+                    update_status(session_id, log=line.strip())
+                    
+            for line in stderr.split('\n'):
+                if line.strip():
+                    update_status(session_id, log=line.strip())
+                    
+            update_status(session_id, progress=75, status='Processing output...')
+            
+            # Determine output path
+            script_name = os.path.splitext(os.path.basename(options['file_path']))[0]
+            
+            if options['platform'] == 'windows' or (options['platform'] == 'auto' and not ON_RENDER):
+                exe_extension = '.exe'
             else:
-                exe_path = os.path.join(work_dir, 'dist', script_name, script_name)
-        
-        if os.path.exists(exe_path):
-            return exe_path
-        else:
-            logger.error(f"Executable not found at expected path: {exe_path}")
-            return None
+                exe_extension = ''
+                
+            if options['one_file']:
+                exe_path = os.path.join(options['work_dir'], 'dist', script_name + exe_extension)
+            else:
+                exe_path = os.path.join(options['work_dir'], 'dist', script_name, script_name + exe_extension)
+            
+            update_status(session_id, progress=85, status='Packaging results...')
+            
+            # Create a zip if there are multiple files or extra files
+            if not options['one_file'] or options['extra_files']:
+                zip_path = os.path.join(options['work_dir'], f'{script_name}_package.zip')
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    if not options['one_file']:
+                        # Add all files from dist directory
+                        dist_dir = os.path.join(options['work_dir'], 'dist', script_name)
+                        for root, dirs, files in os.walk(dist_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, dist_dir)
+                                zipf.write(file_path, arcname)
+                    else:
+                        # Add the exe file
+                        zipf.write(exe_path, os.path.basename(exe_path))
+                    
+                    # Add extra files
+                    for extra_file in options['extra_files']:
+                        zipf.write(extra_file, os.path.basename(extra_file))
+                        
+                download_path = zip_path
+                download_filename = os.path.basename(zip_path)
+            else:
+                download_path = exe_path
+                download_filename = os.path.basename(exe_path)
+            
+            # Check if the file exists
+            if os.path.exists(download_path):
+                # Generate download URL
+                download_url = url_for(
+                    'download_file', 
+                    session_id=session_id,
+                    filename=download_filename
+                )
+                
+                update_status(
+                    session_id,
+                    progress=100,
+                    status='Conversion completed successfully!',
+                    completed=True,
+                    success=True,
+                    message='Your executable is ready for download.',
+                    download_url=download_url
+                )
+            else:
+                update_status(
+                    session_id,
+                    progress=100,
+                    status='Conversion failed',
+                    completed=True,
+                    success=False,
+                    message=f'Output file not found at expected path: {download_path}'
+                )
+                
+        except subprocess.TimeoutExpired:
+            update_status(
+                session_id,
+                progress=100,
+                status='Conversion failed',
+                completed=True,
+                success=False,
+                message='PyInstaller process timed out. Your script may be too complex or there might be issues with dependencies.'
+            )
+        except subprocess.CalledProcessError as e:
+            error_message = e.stderr.decode() if e.stderr else str(e)
+            update_status(
+                session_id,
+                progress=100,
+                status='Conversion failed',
+                completed=True,
+                success=False,
+                message=f'PyInstaller error: {error_message}'
+            )
     
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error running PyInstaller: {e.stderr.decode() if e.stderr else str(e)}")
-        return None
     except Exception as e:
-        logger.error(f"Unexpected error during conversion: {str(e)}")
-        return None
+        logger.error(f"Error during conversion: {str(e)}")
+        update_status(
+            session_id,
+            progress=100,
+            status='Conversion failed',
+            completed=True,
+            success=False,
+            message=f'Unexpected error: {str(e)}'
+        )
 
 @app.route('/download/<session_id>/<filename>')
 def download_file(session_id, filename):
@@ -438,23 +636,33 @@ def cleanup(session_id):
         work_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_id)
         if os.path.exists(work_dir):
             shutil.rmtree(work_dir)
+        
+        # Clean up status dictionary
+        if session_id in conversion_status:
+            del conversion_status[session_id]
+            
         session.pop('session_id', None)
     
     return redirect(url_for('index'))
 
 # Periodic cleanup task
 def cleanup_old_sessions():
-    import threading
-    import time
-    
     while True:
         try:
-            # Get all session directories
+            current_time = time.time()
+            
+            # Clean up old status entries
+            session_ids = list(conversion_status.keys())
+            for session_id in session_ids:
+                if conversion_status[session_id]['completed'] and current_time - conversion_status[session_id].get('timestamp', 0) > 3600:
+                    del conversion_status[session_id]
+            
+            # Clean up old directories
             for item in os.listdir(app.config['UPLOAD_FOLDER']):
                 item_path = os.path.join(app.config['UPLOAD_FOLDER'], item)
                 if os.path.isdir(item_path):
                     # Check if directory is older than 1 hour
-                    if time.time() - os.path.getmtime(item_path) > 3600:
+                    if current_time - os.path.getmtime(item_path) > 3600:
                         logger.info(f"Cleaning up old session: {item}")
                         shutil.rmtree(item_path)
         except Exception as e:
@@ -464,8 +672,6 @@ def cleanup_old_sessions():
         time.sleep(900)
 
 # Start cleanup thread
-import threading
-import sys
 cleanup_thread = threading.Thread(target=cleanup_old_sessions, daemon=True)
 cleanup_thread.start()
 
@@ -474,10 +680,16 @@ def ensure_pyinstaller():
     try:
         import PyInstaller
     except ImportError:
-        subprocess.run(
-            [sys.executable, '-m', 'pip', 'install', 'pyinstaller'],
-            check=True
-        )
+        try:
+            subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', 'pyinstaller'],
+                check=True
+            )
+            logger.info("PyInstaller installed successfully")
+        except Exception as e:
+            logger.error(f"Failed to install PyInstaller: {str(e)}")
+            print(f"Error installing PyInstaller: {str(e)}")
+            # Continue anyway, we'll handle it during conversion
 
 if __name__ == '__main__':
     ensure_pyinstaller()
